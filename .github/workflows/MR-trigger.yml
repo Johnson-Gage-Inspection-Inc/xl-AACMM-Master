@@ -8,14 +8,344 @@ on:
       - main
 
 jobs:
-  MR-workflow:
+  re-validate:
     if: github.event.pull_request.merged == true
-    uses: Johnson-Gage-Inspection-Inc/ci-scripts/.github/workflows/upload-release.yml@main
-    with:
-      repo_name: Johnson-Gage-Inspection-Inc/test
-    secrets:
-      QUALER_EMAIL: ${{ secrets.QUALER_EMAIL }}
-      QUALER_PASSWORD: ${{ secrets.QUALER_PASSWORD }}
-      SHAREPOINT_CLIENT_ID: ${{ secrets.SHAREPOINT_CLIENT_ID}}
-      SHAREPOINT_CLIENT_SECRET: ${{ secrets.SHAREPOINT_CLIENT_SECRET }}
-      SHAREPOINT_TENANT_ID: ${{ secrets.SHAREPOINT_TENANT_ID}}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      EXCEL_FILE: ${{ steps.set-excel-file.outputs.EXCEL_FILE }}
+      UPLOAD: ${{ steps.set-excel-file.outputs.UPLOAD }}
+      COMMIT_HASH: ${{ steps.commit-hash.outputs.COMMIT_HASH }}
+      RELEASE_TAG: ${{ steps.release-tag.outputs.RELEASE_TAG }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Extract Git Commit Info
+        id: commit-hash
+        run: echo "COMMIT_HASH=$(echo $GITHUB_SHA | cut -c1-7)" >> "$GITHUB_OUTPUT"
+
+      - name: Get Release Tag (Current Date)
+        id: release-tag
+        run: echo "RELEASE_TAG=$(date +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Capture Excel File Changes
+        id: capture_changes
+        run: |
+          git fetch --unshallow origin main
+          git diff --name-status HEAD~1 HEAD | grep -E '\.xl' > changed_files.txt || true
+          cat changed_files.txt  # Debugging step
+
+      - name: Count and Validate Excel Files
+        id: set-excel-file
+        run: |
+          EXCEL_COUNT=$(find . -type f -iname "*.xl*" | wc -l)
+          echo "Excel files found: $EXCEL_COUNT"
+
+          if [ "$EXCEL_COUNT" -eq 0 ]; then
+            echo "✅ No Excel files found. Exiting without error."
+            echo "UPLOAD=false" >> "$GITHUB_OUTPUT"
+          elif [ "$EXCEL_COUNT" -eq 1 ]; then
+            if ! [ -s changed_files.txt ]; then
+              echo "✅ No Excel files changed. Exiting without error."
+              echo "UPLOAD=false" >> "$GITHUB_OUTPUT"
+            else
+              EXCEL_FILE=$(find . -type f -iname "*.xl*" | head -n 1)
+              echo "✅ Using Excel file: $EXCEL_FILE"
+              echo "EXCEL_FILE=$EXCEL_FILE" >> "$GITHUB_OUTPUT"
+              echo "UPLOAD=true" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+  update-excel-metadata:
+    needs: re-validate
+    if: needs.re-validate.outputs.UPLOAD == 'true'
+    runs-on: windows-2022
+    permissions:
+      contents: read
+    env:
+      EXCEL_FILE: ${{ needs.re-validate.outputs.EXCEL_FILE }}
+      COMMIT_HASH: ${{ needs.re-validate.outputs.COMMIT_HASH }}
+      RELEASE_TAG: ${{ needs.re-validate.outputs.RELEASE_TAG }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set clock to central time (Windows)
+        run: |
+          tzutil /s "Central Standard Time"
+        shell: pwsh
+
+
+      - name: Checkout CI Scripts Repository
+        uses: actions/checkout@v4
+        with:
+          repository: Johnson-Gage-Inspection-Inc/ci-scripts
+          path: ci-scripts
+
+      - name: Debug Variables
+        run: |
+          echo "DEBUG: COMMIT_HASH=${{ needs.re-validate.outputs.COMMIT_HASH }}"
+          echo "DEBUG: RELEASE_TAG=${{ needs.re-validate.outputs.RELEASE_TAG }}"
+          echo "COMMIT_HASH=${{ needs.re-validate.outputs.COMMIT_HASH }}" >> $GITHUB_ENV
+          echo "RELEASE_TAG=${{ needs.re-validate.outputs.RELEASE_TAG }}" >> $GITHUB_ENV
+
+      - name: Install Python dependencies
+        run: pip install pywin32
+
+      - name: Update Excel Metadata (Revision, Version, Company)
+        id: modify
+        shell: pwsh
+        env:
+          EXCEL_FILE: ${{ needs.re-validate.outputs.EXCEL_FILE }}
+          COMMIT_HASH: ${{ needs.re-validate.outputs.COMMIT_HASH }}
+          RELEASE_TAG: ${{ needs.re-validate.outputs.RELEASE_TAG }}
+        run: |
+          echo "DEBUG: COMMIT_HASH=${{ env.COMMIT_HASH }}"
+          echo "DEBUG: RELEASE_TAG=${{ env.RELEASE_TAG }}"
+
+          if ("${{ env.COMMIT_HASH }}" -eq "") {
+            echo "ERROR: COMMIT_HASH is empty!"; exit 1
+          }
+
+          if ("${{ env.RELEASE_TAG }}" -eq "") {
+            echo "ERROR: RELEASE_TAG is empty!"; exit 1
+          }
+          python ci-scripts/update_excel_metadata.py
+          
+          # Set the output variable for the Excel file path
+          echo "EXCEL_FILE=${{ env.EXCEL_FILE }}" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
+
+      - name: Upload Modified Excel File
+        uses: actions/upload-artifact@v4
+        with:
+          name: updated-excel
+          path: ${{ steps.modify.outputs.EXCEL_FILE }}
+
+  sync-to-sharepoint:
+    needs: [update-excel-metadata, re-validate]
+    if: needs.re-validate.outputs.UPLOAD == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Overwrite with Updated Excel File
+        uses: actions/download-artifact@v4
+        with:
+          name: updated-excel
+
+      - name: Authenticate with SharePoint
+        env:
+          SHAREPOINT_CLIENT_ID: ${{ secrets.SHAREPOINT_CLIENT_ID }}
+          SHAREPOINT_CLIENT_SECRET: ${{ secrets.SHAREPOINT_CLIENT_SECRET }}
+          SHAREPOINT_TENANT_ID: ${{ secrets.SHAREPOINT_TENANT_ID }}
+        run: |
+          TOKEN_RESPONSE=$(curl -X POST \
+            -d "grant_type=client_credentials" \
+            -d "client_id=${SHAREPOINT_CLIENT_ID}" \
+            -d "client_secret=${SHAREPOINT_CLIENT_SECRET}" \
+            -d "scope=https://graph.microsoft.com/.default" \
+            "https://login.microsoftonline.com/${SHAREPOINT_TENANT_ID}/oauth2/v2.0/token")
+
+          ACCESS_TOKEN=$(echo $TOKEN_RESPONSE | jq -r '.access_token')
+          if [ "$ACCESS_TOKEN" == "null" ] || [ -z "$ACCESS_TOKEN" ]; then
+            echo "Token Response: $TOKEN_RESPONSE"  # Debugging step
+            echo "Error: Failed to retrieve access token. Exiting."
+            exit 1
+          fi
+          echo "ACCESS_TOKEN=$ACCESS_TOKEN" >> $GITHUB_ENV
+
+      - name: Upload Excel File to SharePoint
+        env:
+          ACCESS_TOKEN: ${{ env.ACCESS_TOKEN }}
+        run: |
+          FILE_PATH="${{ needs.re-validate.outputs.EXCEL_FILE }}"
+          FILE_NAME=$(basename "$FILE_PATH" | sed 's/ /%20/g')
+          echo "FILE_NAME=$FILE_NAME" # Debugging step
+          
+          # Determine content type based on file extension
+          FILE_EXT="${FILE_PATH##*.}"
+          case "$FILE_EXT" in
+            "xltm")
+              CONTENT_TYPE="application/vnd.ms-excel.template.macroEnabled.12"
+              ;;
+            "xltx")
+              CONTENT_TYPE="application/vnd.openxmlformats-officedocument.spreadsheetml.template"
+              ;;
+            *)
+              echo "Warning: Unknown file extension '$FILE_EXT'. Using default content type."
+              CONTENT_TYPE="application/octet-stream"
+              ;;
+          esac
+          echo "Content-Type: $CONTENT_TYPE" # Debugging step
+          
+          DRIVE_ID="b!62zY21rTlkyTbN2E9veLub0A9-qfsQ1LmVs-siAwkjUpikiIFZhHTb5VFJuc7Xng"
+          UPLOAD_URL="https://graph.microsoft.com/v1.0/drives/$DRIVE_ID/root:/$FILE_NAME:/content"
+
+          RESPONSE=$(curl -X PUT "$UPLOAD_URL" \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            -H "Content-Type: $CONTENT_TYPE" \
+            --data-binary @"$FILE_PATH")
+
+          echo "SharePoint API Response: $RESPONSE"
+
+          if echo "$RESPONSE" | grep -q 'error'; then
+            echo "RESPONSE: $RESPONSE"
+            echo "Upload failed. Exiting."
+            exit 1
+          fi
+
+  rename-file:
+    needs: [update-excel-metadata, re-validate]
+    if: needs.re-validate.outputs.UPLOAD == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      RENAMED_FILE: ${{ steps.rename.outputs.RENAMED_FILE }}
+    steps:
+      - name: Set clock to central time
+        run: sudo timedatectl set-timezone America/Chicago
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Overwrite with Updated Excel File
+        uses: actions/download-artifact@v4
+        with:
+          name: updated-excel
+
+      - name: Rename File with Date
+        id: rename
+        run: |
+          TAGGED_FILE="${{ needs.re-validate.outputs.EXCEL_FILE }}"
+          if [ -z "$TAGGED_FILE" ]; then
+            echo "ERROR: TAGGED_FILE is empty. Exiting."
+            exit 1
+          fi
+          FILE_DIR=$(dirname "$TAGGED_FILE")
+          FILE_NAME=$(basename "$TAGGED_FILE")
+          FILE_BASE="${FILE_NAME%.*}"
+          FILE_EXT="${FILE_NAME##*.}"
+          TODAY=$(date +%m-%d-%Y)
+          RENAMED_FILE="${FILE_DIR}/${FILE_BASE} ${TODAY}.${FILE_EXT}"
+          mv "$TAGGED_FILE" "$RENAMED_FILE"
+          echo "RENAMED_FILE=$RENAMED_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Renamed Excel File
+        uses: actions/upload-artifact@v4
+        with:
+          name: renamed-excel
+          path: ${{ steps.rename.outputs.RENAMED_FILE }}
+
+  upload-to-qualer:
+    needs: [re-validate, update-excel-metadata, rename-file]
+    if: needs.re-validate.outputs.UPLOAD == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Checkout `ci-scripts` Repository
+        uses: actions/checkout@v4
+        with:
+          repository: Johnson-Gage-Inspection-Inc/ci-scripts
+          path: ci-scripts
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Ensure `upload_sop.sh` is Executable
+        run: chmod +x ./ci-scripts/upload_sop.sh
+
+      - name: Download Renamed Excel File
+        uses: actions/download-artifact@v4
+        with:
+          name: renamed-excel
+
+      - name: Run Upload Script
+        run: ./ci-scripts/upload_sop.sh
+        env:
+          QUALER_EMAIL: ${{ secrets.QUALER_EMAIL }}
+          QUALER_PASSWORD: ${{ secrets.QUALER_PASSWORD }}
+          EXCEL_FILE: ${{ needs.rename-file.outputs.RENAMED_FILE }}
+          COMMIT_HASH: ${{ needs.re-validate.outputs.COMMIT_HASH }}
+          AUTHOR_NAME: ${{ github.actor }}
+
+  create-github-release:
+    needs: [re-validate, update-excel-metadata, rename-file]
+    if: needs.re-validate.outputs.UPLOAD == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Renamed Excel File
+        uses: actions/download-artifact@v4
+        with:
+          name: renamed-excel
+          path: .
+
+      - name: Get PR Description
+        id: pr_body
+        run: |
+          PR_NUMBER=$(gh pr list --base main --state merged --limit 1 --json number --jq '.[0].number' || echo "")
+          if [[ -z "$PR_NUMBER" ]]; then
+            echo "No merged PR found. Using commit message."
+            echo "PR_BODY=" >> "$GITHUB_OUTPUT"
+          else
+            PR_BODY=$(gh pr view "$PR_NUMBER" --json body --jq '.body' || echo "")
+            if [[ -z "$PR_BODY" ]]; then
+              echo "⚠️ PR found, but no description available. Using commit message."
+              PR_BODY=""
+            fi
+            PR_BODY_ESCAPED=$(echo "$PR_BODY" | jq -Rs '.')
+            echo "✅ PR Body Retrieved."
+            echo "PR_BODY=$PR_BODY_ESCAPED" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get Latest Commit Message
+        id: commit_message
+        run: |
+          COMMIT_MSG=$(git log -1 --pretty=%B)
+          COMMIT_MSG_ESCAPED=$(echo "$COMMIT_MSG" | jq -Rs '.')
+          echo "COMMIT_MSG=$COMMIT_MSG_ESCAPED" >> "$GITHUB_OUTPUT"
+
+      - name: Determine Release Body
+        id: release_body
+        run: |
+          PR_BODY=${{ steps.pr_body.outputs.PR_BODY }}
+          COMMIT_MSG=${{ steps.commit_message.outputs.COMMIT_MSG }}
+
+          # Ensure PR_BODY is correctly handled and fallback to COMMIT_MSG if empty
+          if [[ -z "$PR_BODY" || "$PR_BODY" == "\"\"" ]]; then
+            RELEASE_BODY="$COMMIT_MSG"
+          else
+            RELEASE_BODY="$PR_BODY"
+          fi
+
+          # Ensure proper escaping for GitHub Actions output
+          {
+            echo "RELEASE_BODY<<EOF"
+            echo "$RELEASE_BODY"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.re-validate.outputs.RELEASE_TAG }}
+          generate_release_notes: true
+          body: ${{ steps.release_body.outputs.RELEASE_BODY }}
+          files: "${{ needs.rename-file.outputs.RENAMED_FILE }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

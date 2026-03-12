@@ -6,13 +6,206 @@ on:
       - main
 
 jobs:
-  validate:
-    uses: Johnson-Gage-Inspection-Inc/ci-scripts/.github/workflows/pre-check.yml@main
-    with:
-      repo_name: Johnson-Gage-Inspection-Inc/test
-    secrets:
-      QUALER_EMAIL: ${{ secrets.QUALER_EMAIL }}
-      QUALER_PASSWORD: ${{ secrets.QUALER_PASSWORD }}
-      SHAREPOINT_CLIENT_ID: ${{ secrets.SHAREPOINT_CLIENT_ID}}
-      SHAREPOINT_CLIENT_SECRET: ${{ secrets.SHAREPOINT_CLIENT_SECRET }}
-      SHAREPOINT_TENANT_ID: ${{ secrets.SHAREPOINT_TENANT_ID}}
+  validate-excel:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      EXCEL_FILE: ${{ steps.set-excel-file.outputs.EXCEL_FILE }}
+      SKIP_UPLOAD: ${{ steps.set-excel-file.outputs.SKIP_UPLOAD }}
+      COMMIT_HASH: ${{ steps.get-commit-hash.outputs.COMMIT_HASH }}
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+  
+      - name: Load environment variables
+        run: |
+          if [ -f ".env" ]; then
+            echo "Loading environment variables from .env"
+            cat ".env" >> $GITHUB_ENV
+          else
+            echo "Warning: .env file not found"
+          fi
+
+      - name: Validate required environment variables
+        run: |
+          REQUIRED_VARS=("SOP_ID" "DOC_ID" "DOC_TITLE" "DOC_DETAILS")
+          MISSING_VARS=()
+          
+          for VAR in "${REQUIRED_VARS[@]}"; do
+            if [[ -z "${!VAR}" ]]; then
+              MISSING_VARS+=("$VAR")
+            fi
+          done
+
+          if [[ ${#MISSING_VARS[@]} -ne 0 ]]; then
+            echo "Error: Missing required environment variables: ${MISSING_VARS[*]}"
+            exit 1
+          fi
+
+      - name: Validate Secrets
+        run: |
+          if [[ -z "${{ secrets.QUALER_EMAIL }}" || -z "${{ secrets.QUALER_PASSWORD }}" ]]; then
+            echo "❌ Missing required secrets."
+            exit 1
+          fi
+
+      - name: Fetch remote branch
+        run: git fetch origin main
+
+      - name: Capture Excel File Changes
+        id: capture_changes
+        run: |
+          git diff --name-status origin/main HEAD | grep -E '\.xl' > changed_files.txt || true
+          cat changed_files.txt  # Debugging step to print the file contents
+
+      - name: Count and Validate Excel Files
+        id: set-excel-file
+        run: |
+            EXCEL_COUNT=$(find . -type f -iname "*.xl*" | wc -l)
+            echo "Excel files found: $EXCEL_COUNT"
+
+            if [ "$EXCEL_COUNT" -eq 0 ]; then
+              if grep -qE '^D' changed_files.txt; then
+                echo "❌ The Excel file was deleted. PR must not delete the Excel file."
+                exit 1
+              else
+                echo "✅ No Excel files found. Exiting without error."
+                echo "SKIP_UPLOAD=true" >> $GITHUB_OUTPUT
+                exit 0
+              fi
+            elif [ "$EXCEL_COUNT" -eq 1 ]; then
+              if ! [ -s changed_files.txt ]; then
+                echo "✅ No Excel files changed. Skipping validation."
+                echo "SKIP_UPLOAD=true" >> $GITHUB_OUTPUT
+                exit 0
+              else
+                EXCEL_FILE=$(find . -type f -iname "*.xl*" | head -n 1)
+                echo "✅ Using Excel file: $EXCEL_FILE"
+                echo "EXCEL_FILE=$EXCEL_FILE" >> $GITHUB_ENV
+                echo "EXCEL_FILE=$EXCEL_FILE" >> $GITHUB_OUTPUT
+              fi
+            else
+              echo "❌ More than one Excel file found! Exiting with error."
+              exit 1
+            fi
+
+      - name: Get Short Commit Hash
+        id: get-commit-hash
+        run: echo "COMMIT_HASH=$(echo $GITHUB_SHA | cut -c1-8)" >> $GITHUB_OUTPUT
+
+  validate-qualer-upload:
+    needs: validate-excel
+    if: needs.validate-excel.outputs.SKIP_UPLOAD != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+  
+      - name: Load environment variables
+        run: |
+          echo "Loading environment variables from .env"
+          cat ".env" >> $GITHUB_ENV
+
+      - name: Checkout `ci-scripts` Repository
+        uses: actions/checkout@v4
+        with:
+          repository: Johnson-Gage-Inspection-Inc/ci-scripts
+          path: ci-scripts
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Ensure `validate_upload.sh` is Executable
+        run: |
+         chmod +x ./ci-scripts/validate_upload.sh
+         chmod +x ./ci-scripts/auth_and_prepare.sh
+
+      - name: Run Upload Validation
+        run: ./ci-scripts/validate_upload.sh
+        env:
+          QUALER_EMAIL: ${{ secrets.QUALER_EMAIL }}
+          QUALER_PASSWORD: ${{ secrets.QUALER_PASSWORD }}
+          COMMIT_HASH: ${{ needs.validate-excel.outputs.COMMIT_HASH }}
+          AUTHOR_NAME: ${{ github.actor }}
+          EXCEL_FILE: ${{ needs.validate-excel.outputs.EXCEL_FILE }}
+
+  authenticate-with-sharepoint:
+    needs: validate-excel
+    if: needs.validate-excel.outputs.SKIP_UPLOAD != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl jq
+        
+      - name: Authenticate with SharePoint
+        env:
+          SHAREPOINT_CLIENT_ID: ${{ secrets.SHAREPOINT_CLIENT_ID }}
+          SHAREPOINT_CLIENT_SECRET: ${{ secrets.SHAREPOINT_CLIENT_SECRET }}
+          SHAREPOINT_TENANT_ID: ${{ secrets.SHAREPOINT_TENANT_ID }}
+        run: |
+          TOKEN_RESPONSE=$(curl -s -X POST \
+            -d "grant_type=client_credentials" \
+            -d "client_id=${SHAREPOINT_CLIENT_ID}@${SHAREPOINT_TENANT_ID}" \
+            -d "client_secret=${SHAREPOINT_CLIENT_SECRET}" \
+            -d "resource=https://graph.microsoft.com/" \
+            "https://login.microsoftonline.com/${SHAREPOINT_TENANT_ID}/oauth2/token")
+
+          ACCESS_TOKEN=$(echo $TOKEN_RESPONSE | jq -r '.access_token')
+          echo "ACCESS_TOKEN=$ACCESS_TOKEN" >> $GITHUB_ENV
+          if [ "$ACCESS_TOKEN" == "null" ] || [ -z "$ACCESS_TOKEN" ]; then
+            echo "❌ Error: Failed to retrieve access token. Exiting."
+            exit 1
+          fi
+
+  validate-excel-references:
+    needs: validate-excel
+    if: needs.validate-excel.outputs.SKIP_UPLOAD != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Load environment variables
+        run: |
+          echo "Loading environment variables from .env"
+          cat ".env" >> $GITHUB_ENV
+
+      - name: Checkout `ci-scripts` Repository
+        uses: actions/checkout@v4
+        with:
+          repository: Johnson-Gage-Inspection-Inc/ci-scripts
+          path: ci-scripts
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install openpyxl
+
+      - name: Make check_excel_refs.py executable
+        run: chmod +x ./ci-scripts/check_excel_refs.py
+
+      - name: Check for \#REF! errors
+        run: python ./ci-scripts/check_excel_refs.py
+        env:
+          EXCEL_FILE: ${{ needs.validate-excel.outputs.EXCEL_FILE }}
+          EXPORT_SHEETS: 'false'
